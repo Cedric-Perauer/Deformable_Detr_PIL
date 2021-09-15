@@ -30,6 +30,9 @@ from .deformable_transformer import build_deforamble_transformer
 import copy
 from torch.utils.data import DataLoader
 import util.misc as utils 
+from datasets.coco_eval import CocoEvaluator
+from pathlib import Path 
+
 
 def match_name_keywords(n, name_keywords):
         out = False
@@ -48,7 +51,7 @@ class DeformableDETR(pl.LightningModule):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False,batch_sampler_train=None,val_sampler=None,
-                 num_workers=2,args=None,param_dicts=None,dataset_train=None,dataset_val=None,dataset_test=None):
+                 num_workers=2,args=None,param_dicts=None,dataset_train=None,dataset_val=None,dataset_test=None,postprocessors=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -74,10 +77,13 @@ class DeformableDETR(pl.LightningModule):
         self.batch_sampler_train = batch_sampler_train
         self.num_workers = num_workers
         self.val_sampler = val_sampler
+        self.postprocessors = postprocessors
         self.num_queries = num_queries
         self.transformer = transformer
+        self.base_ds = path.path("/home/cedric/Deep-Learning/Transformers/DEFOR-DETR/data/coco") #dataset path 
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes)
+        self.batch_size = 8 
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
@@ -246,6 +252,62 @@ class DeformableDETR(pl.LightningModule):
         #print("Averaged stats:", metric_logger)
         return loss      
 
+    def predict_step(self, batch, batch_idx, dataloader_idx):
+        x, y = batch
+        y_hat = self(x)
+    
+    def on_validation_start(self):
+        self.metric_logger = utils.MetricLogger(delimiter="  ")
+        self.metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))
+        self.header = 'Test:'
+
+        self.iou_types = tuple(k for k in ('segm', 'bbox') if k in self.postprocessors.keys())
+        self.coco_evaluator = CocoEvaluator(self.base_ds, self.iou_types)
+        # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
+
+
+
+    @torch.no_grad()
+    def validation_step(self,batch,batch_idx):
+        samples, targets = batch 
+        self.eval()
+        self.criterion.eval()
+        
+        outputs = self(samples)
+        loss_dict = self.criterion(outputs, targets)
+        weight_dict = self.criterion.weight_dict
+
+        # reduce losses over all GPUs for logging purposes
+        loss_dict_reduced_scaled = {k: v * weight_dict[k]
+                                    for k, v in loss_dict.items() if k in weight_dict}
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
+                                      for k, v in loss_dict.items()}
+        self.metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()),
+                             **loss_dict_reduced_scaled,
+                             **loss_dict_reduced_unscaled)
+        self.metric_logger.update(class_error=loss_dict_reduced['class_error'])
+
+        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        results = self.postprocessors['bbox'](outputs, orig_target_sizes)
+        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        if self.coco_evaluator is not None:
+                self.coco_evaluator.update(res)
+
+    def on_validation_end(self):
+        # gather the stats from all processes
+        self.metric_logger.synchronize_between_processes()
+        print("Averaged stats:", self.metric_logger)
+        if self.coco_evaluator is not None:
+            self.coco_evaluator.synchronize_between_processes()
+        # accumulate predictions from all images
+        if self.coco_evaluator is not None:
+            self.coco_evaluator.accumulate()
+            self.coco_evaluator.summarize()
+        self.tats = {k: meter.global_avg for k, meter in self.metric_logger.meters.items()}
+        if coco_evaluator is not None:
+            if 'bbox' in self.postprocessors.keys():
+                self.stats['coco_eval_bbox'] = self.coco_evaluator.coco_eval['bbox'].stats.tolist()
+     
 
     def train_dataloader(self): 
         coco_train = DataLoader(self.dataset_train,collate_fn=utils.collate_fn,
@@ -552,6 +614,7 @@ def build(args,dataset_train,dataset_val):
    
     transformer = build_deforamble_transformer(args)
     print("Build Transformer and Backbone done") 
+    postprocessors = {'bbox': PostProcess()}
     model = DeformableDETR(
         backbone,
         transformer,
@@ -563,7 +626,7 @@ def build(args,dataset_train,dataset_val):
         two_stage=args.two_stage,
         batch_sampler_train = torch.utils.data.RandomSampler(dataset_train) , 
         val_sampler = torch.utils.data.RandomSampler(dataset_val), 
-        args = args,dataset_train=dataset_train,dataset_val=dataset_val
+        args = args,dataset_train=dataset_train,dataset_val=dataset_val,postprocessors=postprocessors
     )
     #if args.masks:
     #    model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -584,7 +647,6 @@ def build(args,dataset_train,dataset_val):
     #if args.masks:
     #    losses += ["masks"]
     # num_classes, matcher, weight_dict, losses, focal_alpha=0.25
-    postprocessors = {'bbox': PostProcess()}
     #if args.masks:
     #    postprocessors['segm'] = PostProcessSegm()
     #    if args.dataset_file == "coco_panoptic":
